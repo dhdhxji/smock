@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -6,13 +7,34 @@
 #include <sys/user.h>
 #include <sys/reg.h>
     
+
+
+typedef long word_t;
+
+
 void dump_regs(pid_t process)
 {
     struct user_regs_struct regs;
     ptrace(PTRACE_GETREGS, process, NULL, &regs);
     
-    printf("RAX: %lld\n", regs.orig_rax);
+    printf("ORIG_RAX: %lld\n", regs.orig_rax);
+    printf("RAX: %lld\n", regs.rax);
+    printf("RDI: %lld\n", regs.rdi);
+    printf("RSI: %lld\n", regs.rsi);
+    printf("RDX: %lld\n", regs.rdx);
 }
+
+void *pmemcpy_from(pid_t pid, void *src, void *dst, size_t nbytes)
+{
+    for(size_t i = 0; i < nbytes; i += sizeof(void*))
+    {
+        ((word_t *)dst)[i / sizeof(void*)] = ptrace(PTRACE_PEEKTEXT, pid, src + i, NULL);
+    }
+
+    return dst;
+}
+
+
 
 typedef enum {
     TRACER_INIT,
@@ -25,6 +47,26 @@ typedef struct {
     tracer_state state;
 } tracer_context;
 
+
+
+void handle_tracee_syscall_entry(pid_t pid, word_t syscall, tracer_context *ctx)
+{
+    if (1 == syscall && 1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
+    {
+        word_t size = ptrace(PTRACE_PEEKUSER, pid, (8 * RDX), NULL);
+        char *data = malloc(size); 
+        pmemcpy_from(pid, (void*)ptrace(PTRACE_PEEKUSER, pid, (8 * RSI), NULL), data, size);
+        printf("Got printf with size %ld: %s\n", size, data);
+    }
+}
+
+void handle_tracee_syscall_exit(pid_t pid, word_t syscall, tracer_context *ctx)
+{
+    (void) pid;
+    (void) syscall;
+    (void) ctx;
+}
+
 int handle_tracee_stop(pid_t pid, int waitpid_status, tracer_context *ctx)
 {
     /* Note that there are *three* reasons why the child might stop
@@ -34,18 +76,20 @@ int handle_tracee_stop(pid_t pid, int waitpid_status, tracer_context *ctx)
     *  3) child calls exec
     * TODO: breakpoint reached
     */
-    const int syscall = ptrace(PTRACE_PEEKUSER, pid, (8 * ORIG_RAX), NULL);
-    const int syscall_ret = ptrace(PTRACE_PEEKUSER, pid, (8 * RAX), NULL);
+    const word_t syscall = ptrace(PTRACE_PEEKUSER, pid, (8 * ORIG_RAX), NULL);
+    // const word_t syscall_ret = ptrace(PTRACE_PEEKUSER, pid, (8 * RAX), NULL);
     
     switch(ctx->state)
     {
     case TRACER_SYSCALL_START:
-        printf("Entered syscall = %d ret = %d\n", syscall, syscall_ret);
+        // printf("Entered syscall = %ld ret = %ld\n", syscall, syscall_ret);
         ctx->state = TRACER_SYSCALL_END;
+
+        handle_tracee_syscall_entry(pid, syscall, ctx);
         break;
 
     case TRACER_SYSCALL_END:
-        printf("Exited syscall = %d ret = %d\n", syscall, syscall_ret);
+        // printf("Exited syscall = %ld ret = %ld\n", syscall, syscall_ret);
         
         // Exec will generate a notification which we need to handle
         if (59 == syscall) 
@@ -56,12 +100,14 @@ int handle_tracee_stop(pid_t pid, int waitpid_status, tracer_context *ctx)
         {
             ctx->state = TRACER_SYSCALL_START;
         }
+        
+        handle_tracee_syscall_exit(pid, syscall, ctx);
         break;
 
     case TRACER_EXEC_NOTIFY:
         if (59 != syscall)
         {
-            printf("Expected exec notification, got syscall = %d ret = %d\n", syscall, syscall_ret);
+            printf("Expected exec notification, got syscall = %ld\n", syscall);
             return -1;
         }
 

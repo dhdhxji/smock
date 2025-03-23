@@ -24,11 +24,21 @@ void dump_regs(pid_t process)
     printf("RDX: %lld\n", regs.rdx);
 }
 
-void *pmemcpy_from(pid_t pid, void *src, void *dst, size_t nbytes)
+void *pmemcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes)
 {
     for(size_t i = 0; i < nbytes; i += sizeof(void*))
     {
         ((word_t *)dst)[i / sizeof(void*)] = ptrace(PTRACE_PEEKTEXT, pid, src + i, NULL);
+    }
+
+    return dst;
+}
+
+void *pmemcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes)
+{
+    for(size_t i = 0; i < nbytes; i += sizeof(void*))
+    {
+        long ret = ptrace(PTRACE_POKETEXT, pid, dst + i, ((word_t *)src)[i / sizeof(void*)]);
     }
 
     return dst;
@@ -54,17 +64,28 @@ void handle_tracee_syscall_entry(pid_t pid, word_t syscall, tracer_context *ctx)
     if (1 == syscall && 1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
     {
         word_t size = ptrace(PTRACE_PEEKUSER, pid, (8 * RDX), NULL);
-        char *data = malloc(size); 
-        pmemcpy_from(pid, (void*)ptrace(PTRACE_PEEKUSER, pid, (8 * RSI), NULL), data, size);
-        printf("Got printf with size %ld: %s\n", size, data);
+
+        char *local_message = malloc(size); 
+        char *tracee_message_addr = (void*)ptrace(PTRACE_PEEKUSER, pid, (8 * RSI), NULL);
+
+        pmemcpy_from(pid, local_message, tracee_message_addr, size);
+
+        printf("Got printf with size %ld: %s\n", size, local_message);
+        const char spoofed_message[16] = "spoofed ya\n";
+        
+        pmemcpy_to(pid, tracee_message_addr, spoofed_message, sizeof(spoofed_message));
+        ptrace(PTRACE_POKEUSER, pid, (8 * RDX), sizeof(spoofed_message));
     }
 }
 
 void handle_tracee_syscall_exit(pid_t pid, word_t syscall, tracer_context *ctx)
 {
-    (void) pid;
-    (void) syscall;
     (void) ctx;
+
+    if (1 == syscall && 1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
+    {
+        ptrace(PTRACE_POKEUSER, pid, (8 * RAX), 34);
+    }
 }
 
 int handle_tracee_stop(pid_t pid, int waitpid_status, tracer_context *ctx)

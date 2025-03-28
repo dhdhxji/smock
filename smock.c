@@ -10,6 +10,9 @@
 #include <sys/user.h>
 #include <sys/reg.h>
     
+// TODO: Introduce platform-specific layer for retrieving info
+//       about system calls
+#define SYSCALL_COUNT 400
 #define BIT(n) (1 << (n))
 #define PTRACE_EVT(status) ((status) >> 16)
 #define DIEIF(condition, message) assert(( !(condition) ) && (message))
@@ -49,7 +52,17 @@ void *pmemcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes)
 }
 
 typedef struct {
+    void (*entered)(pid_t pid, int syscall);
+    void (*exited)(pid_t pid, int syscall);
+} tracer_syscall_hook;
+
+typedef struct {
+    tracer_syscall_hook syscall_hooks[SYSCALL_COUNT];
+} tracer_config;
+
+typedef struct {
     pid_t tracee_pid;
+    tracer_config *cfg;
 } tracer_context;
 
 typedef enum {
@@ -90,12 +103,39 @@ const char *tracee_evt_str(tracee_event_type type)
     };
 }
 
+int set_tracing_traps(tracer_context *ctx)
+{
+    int status = ptrace(PTRACE_SETOPTIONS, ctx->tracee_pid, NULL,
+          PTRACE_O_TRACEEXEC 
+        | PTRACE_O_TRACEEXIT 
+        | PTRACE_O_TRACESYSGOOD
+    ); 
+    if (status) goto ptrace_fail;
+    
+    status = ptrace(PTRACE_SYSCALL, ctx->tracee_pid, NULL, 0);
+    if (status) goto ptrace_fail;
+
+    return status;
+
+ptrace_fail:
+    printf("ptrace returned an error %d, errno=%d\n", status, errno);
+    DIEIF(true, "^^");
+
+    return -1;
+}
+
 int expect_tracee_evt(tracer_context *ctx, tracee_event_type event_mask, tracee_event *catched_event)
 {
     int tracee_status = -1;
-    int status = waitpid(ctx->tracee_pid, &tracee_status, 0);
+    int status = set_tracing_traps(ctx);
+    if (status)
+    {
+        printf("Failed to set tracing traps %d\n", status);
+        return -1;
+    }
 
-    // DIEIF(status != ctx->tracee_pid, "waitpid() returned an error");
+    status = waitpid(ctx->tracee_pid, &tracee_status, 0);
+
     if (ECHILD == status)
     {
         catched_event->type = TRACEE_EVT_DISAPPEARED;
@@ -151,23 +191,7 @@ int expect_tracee_evt(tracer_context *ctx, tracee_event_type event_mask, tracee_
         DIEIF(true, "^^");
     }
     
-    status = ptrace(PTRACE_SETOPTIONS, ctx->tracee_pid, NULL,
-          PTRACE_O_TRACEEXEC 
-        | PTRACE_O_TRACEEXIT 
-        | PTRACE_O_TRACESYSGOOD
-    ); 
-    if (status) goto ptrace_fail;
-    
-    status = ptrace(PTRACE_SYSCALL, ctx->tracee_pid, NULL, 0);
-    if (status) goto ptrace_fail;
-    
     return (catched_event->type & event_mask) != 0 ? 0 : -1;
-
-ptrace_fail:
-    printf("ptrace returned an error %d, errno=%d\n", status, errno);
-    DIEIF(true, "^^");
-
-    return -1;
 }
 
 int expect_tracee_evt_or_exit(tracer_context *ctx, tracee_event_type event_mask, tracee_event *catched_evt)
@@ -195,51 +219,68 @@ int expect_tracee_evt_or_exit(tracer_context *ctx, tracee_event_type event_mask,
     }
 }
 
-void handle_tracee_syscall_entry(pid_t pid, word_t syscall, tracer_context *ctx)
+void handle_tracee_syscall_evt(tracer_context *ctx)
 {
-    if (1 == syscall && 1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
+    const word_t syscall = ptrace(PTRACE_PEEKUSER, ctx->tracee_pid, (8 * ORIG_RAX), NULL);
+    if (syscall < 0 || syscall >= SYSCALL_COUNT)
     {
-        word_t size = ptrace(PTRACE_PEEKUSER, pid, (8 * RDX), NULL);
-
-        char *local_message = malloc(size); 
-        char *tracee_message_addr = (void*)ptrace(PTRACE_PEEKUSER, pid, (8 * RSI), NULL);
-
-        pmemcpy_from(pid, local_message, tracee_message_addr, size);
-
-        printf("Got printf with size %ld: %s\n", size, local_message);
-        const char spoofed_message[16] = "spoofed ya\n";
-        
-        pmemcpy_to(pid, tracee_message_addr, spoofed_message, sizeof(spoofed_message));
-        ptrace(PTRACE_POKEUSER, pid, (8 * RDX), sizeof(spoofed_message));
+        printf("Invaliid syscall number %ld, there is nothing we can do in this hopeless situation...\n", syscall);
+        DIEIF(true, "^^");
     }
-}
 
-void handle_tracee_syscall_exit(pid_t pid, word_t syscall, tracer_context *ctx)
-{
-    (void) ctx;
-
-    if (1 == syscall && 1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
+    const tracer_syscall_hook *hook = &ctx->cfg->syscall_hooks[syscall];
+    if (hook->entered)
     {
-        ptrace(PTRACE_POKEUSER, pid, (8 * RAX), 34);
+        hook->entered(ctx->tracee_pid, syscall);
     }
-}
-
-int run_tracer(pid_t tracee_pid)
-{
-    tracer_context ctx = {
-        .tracee_pid = tracee_pid
-    };
 
     tracee_event event;
-    int status = expect_tracee_evt(&ctx, TRACEE_EVT_INIT, &event);
+    int status = expect_tracee_evt(
+        ctx,
+        TRACEE_EVT_SYSCALL | TRACEE_EVT_EXEC_NOTIFICATION | TRACEE_EVT_EXITED,
+        &event);
+
     if (status)
     {
-        printf("Expected TRACEE_EVT_INIT, got %d\n", event.type);
-        exit(1);
+        printf("Expected syscall end event, exec notification or exit event got %s\n", tracee_evt_str(event.type));
+        DIEIF(true, "^^");
     }
 
+    if (TRACEE_EVT_EXEC_NOTIFICATION == event.type)
+    {
+        status = expect_tracee_evt(ctx, TRACEE_EVT_SYSCALL, &event);
+        if (status)
+        {
+            printf("Expected syscall end event, got %s\n", tracee_evt_str(event.type));
+            DIEIF(true, "^^");
+        }
+    }
+    else if (TRACEE_EVT_EXITED == event.type)
+    {
+        printf("Tracee exited by exit(%d) syscall\n", event.exit_code);
+        exit(0);
+    }
+
+    if (hook->exited)
+    {
+        hook->exited(ctx->tracee_pid, syscall);
+    }
+}
+
+int run_tracer(pid_t tracee_pid, tracer_config *cfg)
+{
+    tracer_context ctx = {
+        .tracee_pid = tracee_pid,
+        .cfg = cfg
+    };
+
+    int wait_status;
+    waitpid(tracee_pid, &wait_status, 0);
+    DIEIF(!WIFSTOPPED(wait_status) || WSTOPSIG(wait_status) != SIGSTOP, "Expected SIGSTOP");
+
     // Our own exec doesn't counts as a traceable/interceptable syscall
-    status = expect_tracee_evt(&ctx, TRACEE_EVT_SYSCALL, &event);
+    tracee_event event;
+    int status = expect_tracee_evt(&ctx, TRACEE_EVT_SYSCALL, &event);
     if (status)
     {
         printf("Expected exec sysall entry event, got %s\n", tracee_evt_str(event.type));
@@ -273,15 +314,15 @@ int run_tracer(pid_t tracee_pid)
             exit(1);
         }
 
-        printf("Received tracee event %s\n", tracee_evt_str(event.type));
+        switch(event.type)
+        {
+        case TRACEE_EVT_SYSCALL:
+            handle_tracee_syscall_evt(&ctx);
+            break;
+        default:
+            printf("Received tracee event %s\n", tracee_evt_str(event.type));
+        };
     }
-    
-    // int tracee_status;
-    // while (waitpid(tracee_pid, &tracee_status, 0))
-    // {
-    //     
-    //     ptrace(PTRACE_SYSCALL, tracee_pid, NULL, 0);
-    // }
 
     return 0;
 }
@@ -295,6 +336,37 @@ int run_tracee(const char* exec_path, char* const* args)
     return execv(exec_path, args);
 }
 
+
+
+void example_handle_write_entry(pid_t pid, int syscall)
+{
+    // Intercept stdout write
+    if (1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
+    {
+        word_t size = ptrace(PTRACE_PEEKUSER, pid, (8 * RDX), NULL);
+
+        char *local_message = malloc(size); 
+        char *tracee_message_addr = (void*)ptrace(PTRACE_PEEKUSER, pid, (8 * RSI), NULL);
+
+        pmemcpy_from(pid, local_message, tracee_message_addr, size);
+
+        printf("tracer: Got printf with size %ld: %s\n", size, local_message);
+        const char spoofed_message[16] = "spoofed ya\n";
+        
+        pmemcpy_to(pid, tracee_message_addr, spoofed_message, sizeof(spoofed_message));
+        ptrace(PTRACE_POKEUSER, pid, (8 * RDX), sizeof(spoofed_message));
+    }
+}
+
+void example_handle_write_exit(pid_t pid, int syscall)
+{
+    if (1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
+    {
+        ptrace(PTRACE_POKEUSER, pid, (8 * RAX), 34);
+    }
+}
+
+
 int main()
 {
     pid_t tracee_pid = fork();
@@ -302,19 +374,21 @@ int main()
     if (tracee_pid == 0)
     {
         return run_tracee(
-            // "/usr/bin/cat",
-            // (char*[]){
-            //     "cat",
-            //     "bnrun.sh",
-            //     NULL
-            // }
             "./test",
             NULL
         );
     }
     else
     {
-        return run_tracer(tracee_pid);
+        tracer_config cfg = {0};
+       
+        // Example with write(=1) syscall spoofing
+        cfg.syscall_hooks[1] = (tracer_syscall_hook){
+            .entered = example_handle_write_entry,
+            .exited = example_handle_write_exit
+        };
+
+        return run_tracer(tracee_pid, &cfg);
     }
 
     return 0;

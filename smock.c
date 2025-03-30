@@ -11,7 +11,7 @@
 #include <sys/reg.h>
 #include <string.h>
 
-#define PTRACE_REGS_TYPE struct user_regs_struct 
+typedef struct user_regs_struct regs_t;
 #define SYSCALL_NR(regs) (regs).orig_rax
 #define SYSCALL_RET(egs) (regs).rax
 #define SYSCALL_ARG0(regs) (regs).rdi
@@ -138,7 +138,7 @@ void print_syscall_arg_value(syscall_arg_type type, word_t value)
     }
 }
 
-static inline word_t get_syscall_arg_raw_value(PTRACE_REGS_TYPE *regs, int number)
+static inline word_t get_syscall_arg_raw_value(regs_t *regs, int number)
 {
     switch(number)
     {
@@ -169,7 +169,7 @@ static inline word_t get_syscall_arg_raw_value(PTRACE_REGS_TYPE *regs, int numbe
 
 void dump_syscall(pid_t process, bool is_entry)
 {
-    PTRACE_REGS_TYPE regs;
+    regs_t regs;
     ptrace(PTRACE_GETREGS, process, NULL, &regs);
 
     int syscall_nr = SYSCALL_NR(regs);
@@ -489,12 +489,14 @@ int run_tracee(const char* exec_path, char* const* args)
 void example_handle_write_entry(pid_t pid, int syscall)
 {
     // Intercept stdout write
-    if (1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
+    regs_t regs;
+    ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+    if (1 == SYSCALL_ARG0(regs))
     {
-        word_t size = ptrace(PTRACE_PEEKUSER, pid, (8 * RDX), NULL);
+        word_t size = SYSCALL_ARG2(regs);
 
         char *local_message = malloc(size); 
-        char *tracee_message_addr = (void*)ptrace(PTRACE_PEEKUSER, pid, (8 * RSI), NULL);
+        char *tracee_message_addr = (void*)SYSCALL_ARG1(regs);
 
         pmemcpy_from(pid, local_message, tracee_message_addr, size);
 
@@ -502,7 +504,8 @@ void example_handle_write_entry(pid_t pid, int syscall)
         const char spoofed_message[16] = "spoofed ya\n";
         
         pmemcpy_to(pid, tracee_message_addr, spoofed_message, sizeof(spoofed_message));
-        ptrace(PTRACE_POKEUSER, pid, (8 * RDX), sizeof(spoofed_message));
+        SYSCALL_ARG2(regs) = (word_t)sizeof(spoofed_message);
+        ptrace(PTRACE_SETREGS, pid, NULL, &regs);
     }
 }
 

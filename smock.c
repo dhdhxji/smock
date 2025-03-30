@@ -9,47 +9,37 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/reg.h>
-    
-// TODO: Introduce platform-specific layer for retrieving info
-//       about system calls
-#define SYSCALL_COUNT 400
+
+#define PTRACE_REGS_TYPE struct user_regs_struct 
+#define SYSCALL_NR(regs) (regs).orig_rax
+#define SYSCALL_RET(egs) (regs).rax
+#define SYSCALL_ARG0(regs) (regs).rdi
+#define SYSCALL_ARG1(regs) (regs).rsi
+#define SYSCALL_ARG2(regs) (regs).rdx
+#define SYSCALL_ARG3(regs) (regs).r10
+#define SYSCALL_ARG4(regs) (regs).r8
+#define SYSCALL_ARG5(regs) (regs).r9
+
 #define BIT(n) (1 << (n))
 #define PTRACE_EVT(status) ((status) >> 16)
 #define DIEIF(condition, message) assert(( !(condition) ) && (message))
 
 typedef long word_t;
 
-void dump_regs(pid_t process)
-{
-    struct user_regs_struct regs;
-    ptrace(PTRACE_GETREGS, process, NULL, &regs);
-    
-    printf("ORIG_RAX: %lld\n", regs.orig_rax);
-    printf("RAX: %lld\n", regs.rax);
-    printf("RDI: %lld\n", regs.rdi);
-    printf("RSI: %lld\n", regs.rsi);
-    printf("RDX: %lld\n", regs.rdx);
-}
+typedef struct {
+    char const *name;
+    size_t argument_count;
+} syscall_def;
 
-void *pmemcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes)
-{
-    for(size_t i = 0; i < nbytes; i += sizeof(void*))
-    {
-        ((word_t *)dst)[i / sizeof(void*)] = ptrace(PTRACE_PEEKTEXT, pid, src + i, NULL);
-    }
-
-    return dst;
-}
-
-void *pmemcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes)
-{
-    for(size_t i = 0; i < nbytes; i += sizeof(void*))
-    {
-        long ret = ptrace(PTRACE_POKETEXT, pid, dst + i, ((word_t *)src)[i / sizeof(void*)]);
-    }
-
-    return dst;
-}
+static const syscall_def syscall_table[] = {
+    [1] = (syscall_def){
+        .name = "write",
+        .argument_count = 3
+    },
+    // TODO
+    [400] = { 0 }
+};
+#define SYSCALL_NR_MAX ((sizeof(syscall_table) / sizeof(syscall_def)) - 1)
 
 typedef struct {
     void (*entered)(pid_t pid, int syscall);
@@ -57,7 +47,7 @@ typedef struct {
 } tracer_syscall_hook;
 
 typedef struct {
-    tracer_syscall_hook syscall_hooks[SYSCALL_COUNT];
+    tracer_syscall_hook syscall_hooks[SYSCALL_NR_MAX + 1];
 } tracer_config;
 
 typedef struct {
@@ -81,6 +71,50 @@ typedef struct {
         int exit_code;
     };
 } tracee_event;
+
+void dump_syscall(pid_t process, bool is_entry)
+{
+    PTRACE_REGS_TYPE regs;
+    ptrace(PTRACE_GETREGS, process, NULL, &regs);
+
+    int syscall_nr = SYSCALL_NR(regs);
+    if (syscall_nr < 0 || syscall_nr > SYSCALL_NR_MAX)
+    {
+        printf("Invalid syscall number %d\n", syscall_nr);
+        return;
+    }
+
+    const syscall_def *syscall = &syscall_table[syscall_nr];
+    
+    printf("syscall %s %s(%d)\n", is_entry ? "entry" : "exit", syscall->name, syscall_nr);
+    if (syscall->argument_count >=1) printf("  0: %lld\n", SYSCALL_ARG0(regs));
+    if (syscall->argument_count >=2) printf("  1: %lld\n", SYSCALL_ARG1(regs));
+    if (syscall->argument_count >=3) printf("  2: %lld\n", SYSCALL_ARG2(regs));
+    if (syscall->argument_count >=4) printf("  3: %lld\n", SYSCALL_ARG3(regs));
+    if (syscall->argument_count >=5) printf("  4: %lld\n", SYSCALL_ARG4(regs));
+    if (syscall->argument_count >=6) printf("  5: %lld\n", SYSCALL_ARG5(regs));
+    if (!is_entry)                   printf("  ret: %lld\n", SYSCALL_RET(regs));
+}
+
+void *pmemcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes)
+{
+    for(size_t i = 0; i < nbytes; i += sizeof(void*))
+    {
+        ((word_t *)dst)[i / sizeof(void*)] = ptrace(PTRACE_PEEKTEXT, pid, src + i, NULL);
+    }
+
+    return dst;
+}
+
+void *pmemcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes)
+{
+    for(size_t i = 0; i < nbytes; i += sizeof(void*))
+    {
+        long ret = ptrace(PTRACE_POKETEXT, pid, dst + i, ((word_t *)src)[i / sizeof(void*)]);
+    }
+
+    return dst;
+}
 
 const char *tracee_evt_str(tracee_event_type type)
 {
@@ -222,7 +256,7 @@ int expect_tracee_evt_or_exit(tracer_context *ctx, tracee_event_type event_mask,
 void handle_tracee_syscall_evt(tracer_context *ctx)
 {
     const word_t syscall = ptrace(PTRACE_PEEKUSER, ctx->tracee_pid, (8 * ORIG_RAX), NULL);
-    if (syscall < 0 || syscall >= SYSCALL_COUNT)
+    if (syscall < 0 || syscall > SYSCALL_NR_MAX)
     {
         printf("Invaliid syscall number %ld, there is nothing we can do in this hopeless situation...\n", syscall);
         DIEIF(true, "^^");
@@ -340,6 +374,8 @@ int run_tracee(const char* exec_path, char* const* args)
 
 void example_handle_write_entry(pid_t pid, int syscall)
 {
+    dump_syscall(pid, true);
+
     // Intercept stdout write
     if (1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
     {
@@ -360,6 +396,7 @@ void example_handle_write_entry(pid_t pid, int syscall)
 
 void example_handle_write_exit(pid_t pid, int syscall)
 {
+    dump_syscall(pid, false);
     if (1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
     {
         ptrace(PTRACE_POKEUSER, pid, (8 * RAX), 34);

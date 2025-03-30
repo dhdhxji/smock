@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/reg.h>
+#include <string.h>
 
 #define PTRACE_REGS_TYPE struct user_regs_struct 
 #define SYSCALL_NR(regs) (regs).orig_rax
@@ -24,17 +25,60 @@
 #define PTRACE_EVT(status) ((status) >> 16)
 #define DIEIF(condition, message) assert(( !(condition) ) && (message))
 
-typedef long word_t;
+typedef long long int word_t;
+
+typedef enum {
+    SYSCALL_ARG_TYPE_SWORD,
+    SYSCALL_ARG_TYPE_UWORD,
+    SYSCALL_ARG_TYPE_BYTE,
+    // TODO: structs
+} syscall_arg_type;
+
+typedef enum {
+    SYSCALL_ARG_FLAG_POINTER    = BIT(0),
+    SYSCALL_ARG_FLAG_ARRAY      = BIT(1)
+} syscall_arg_flags;
 
 typedef struct {
     char const *name;
-    size_t argument_count;
+    syscall_arg_type type;
+    syscall_arg_flags flags;
+    union {
+        int array_size_arg;
+        // TODO: struct defs
+    };
+} syscall_arg_def;
+
+typedef struct {
+    char const *name;
+    syscall_arg_def *args;
+    syscall_arg_def ret;
 } syscall_def;
 
 static const syscall_def syscall_table[] = {
     [1] = (syscall_def){
         .name = "write",
-        .argument_count = 3
+        .args = (syscall_arg_def[]){
+            {
+                .name = "fd",
+                .type = SYSCALL_ARG_TYPE_UWORD
+            },
+            {
+                .name = "buf",
+                .type = SYSCALL_ARG_TYPE_BYTE,
+                .flags = SYSCALL_ARG_FLAG_ARRAY,
+                .array_size_arg = 2
+            },
+            {
+                .name = "count",
+                .type = SYSCALL_ARG_TYPE_UWORD
+            },
+            { 0 }
+        },
+        .ret = {
+            .name = "bytes written",
+            .type = SYSCALL_ARG_TYPE_SWORD
+        }
     },
     // TODO
     [400] = { 0 }
@@ -72,6 +116,57 @@ typedef struct {
     };
 } tracee_event;
 
+void print_syscall_arg_value(syscall_arg_type type, word_t value)
+{
+    switch(type)
+    {
+    case SYSCALL_ARG_TYPE_SWORD:
+        printf("%lld", value);
+        break;
+
+    case SYSCALL_ARG_TYPE_UWORD:
+        printf("%llu", value);
+        break;
+
+    case SYSCALL_ARG_TYPE_BYTE:
+        printf("%X", (char)value);
+        break;
+
+    default:
+        // Fallback to signed word...
+        printf("%lld", value);
+    }
+}
+
+static inline word_t get_syscall_arg_raw_value(PTRACE_REGS_TYPE *regs, int number)
+{
+    switch(number)
+    {
+    case 0:
+        return SYSCALL_ARG0(*regs);
+
+    case 1:
+        return SYSCALL_ARG1(*regs);
+
+    case 2:
+        return SYSCALL_ARG2(*regs);
+
+    case 3:
+        return SYSCALL_ARG3(*regs);
+
+    case 4:
+        return SYSCALL_ARG4(*regs);
+
+    case 5:
+        return SYSCALL_ARG5(*regs);
+
+    default:
+        printf("Invalid syscall arg number %d\n", number);
+        DIEIF(true, "^^");
+    }
+    return -1;
+}
+
 void dump_syscall(pid_t process, bool is_entry)
 {
     PTRACE_REGS_TYPE regs;
@@ -87,13 +182,32 @@ void dump_syscall(pid_t process, bool is_entry)
     const syscall_def *syscall = &syscall_table[syscall_nr];
     
     printf("syscall %s %s(%d)\n", is_entry ? "entry" : "exit", syscall->name, syscall_nr);
-    if (syscall->argument_count >=1) printf("  0: %lld\n", SYSCALL_ARG0(regs));
-    if (syscall->argument_count >=2) printf("  1: %lld\n", SYSCALL_ARG1(regs));
-    if (syscall->argument_count >=3) printf("  2: %lld\n", SYSCALL_ARG2(regs));
-    if (syscall->argument_count >=4) printf("  3: %lld\n", SYSCALL_ARG3(regs));
-    if (syscall->argument_count >=5) printf("  4: %lld\n", SYSCALL_ARG4(regs));
-    if (syscall->argument_count >=6) printf("  5: %lld\n", SYSCALL_ARG5(regs));
-    if (!is_entry)                   printf("  ret: %lld\n", SYSCALL_RET(regs));
+    
+    const syscall_arg_def zero_arg = { 0 };
+    for (int i = 0; memcmp(&zero_arg, &syscall->args[i], sizeof(zero_arg)); ++i)
+    {
+        const syscall_arg_def *arg = &syscall->args[i];
+        word_t raw_value = get_syscall_arg_raw_value(&regs, i);
+  
+        if (SYSCALL_ARG_FLAG_ARRAY & arg->flags)
+        {
+            const word_t size = get_syscall_arg_raw_value(&regs, arg->array_size_arg);
+            printf("  %d: %p: Array of size %llu\n", i, (void*)raw_value, size);
+        }
+        else if (SYSCALL_ARG_FLAG_POINTER & arg->flags)
+        {
+            printf("  %d: %lld: Pointer\n", i, raw_value);
+        }
+        else
+        {
+            //printf("  %d: %lld: Primitive value (probably)\n", i, raw_value);
+            printf("  %d: ", i); 
+            print_syscall_arg_value(arg->type, raw_value);
+            printf("\n");
+        }
+    }
+    
+    if (!is_entry) printf("  ret: %lld\n", SYSCALL_RET(regs));
 }
 
 void *pmemcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes)
@@ -258,7 +372,7 @@ void handle_tracee_syscall_evt(tracer_context *ctx)
     const word_t syscall = ptrace(PTRACE_PEEKUSER, ctx->tracee_pid, (8 * ORIG_RAX), NULL);
     if (syscall < 0 || syscall > SYSCALL_NR_MAX)
     {
-        printf("Invaliid syscall number %ld, there is nothing we can do in this hopeless situation...\n", syscall);
+        printf("Invaliid syscall number %lld, there is nothing we can do in this hopeless situation...\n", syscall);
         DIEIF(true, "^^");
     }
 
@@ -374,8 +488,6 @@ int run_tracee(const char* exec_path, char* const* args)
 
 void example_handle_write_entry(pid_t pid, int syscall)
 {
-    dump_syscall(pid, true);
-
     // Intercept stdout write
     if (1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
     {
@@ -386,7 +498,7 @@ void example_handle_write_entry(pid_t pid, int syscall)
 
         pmemcpy_from(pid, local_message, tracee_message_addr, size);
 
-        printf("tracer: Got printf with size %ld: %s\n", size, local_message);
+        printf("tracer: Got printf with size %lld: %s\n", size, local_message);
         const char spoofed_message[16] = "spoofed ya\n";
         
         pmemcpy_to(pid, tracee_message_addr, spoofed_message, sizeof(spoofed_message));
@@ -396,11 +508,11 @@ void example_handle_write_entry(pid_t pid, int syscall)
 
 void example_handle_write_exit(pid_t pid, int syscall)
 {
-    dump_syscall(pid, false);
     if (1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
     {
         ptrace(PTRACE_POKEUSER, pid, (8 * RAX), 34);
     }
+    dump_syscall(pid, false);
 }
 
 

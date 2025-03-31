@@ -55,6 +55,13 @@ typedef struct {
     syscall_arg_def ret;
 } syscall_def;
 
+// TODO: This table should contain meta info
+//       about syscalls, including human-readable names,
+//       info about its parameters and structs which will
+//       be user later for convinient lua API (or not), basically
+//       to call user defined syscall handlers with syscall parameters
+//       represented by lua tables.
+//       In any case, I should revisit this table on later stages of development.
 static const syscall_def syscall_table[] = {
     [1] = (syscall_def){
         .name = "write",

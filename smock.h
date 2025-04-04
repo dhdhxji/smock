@@ -1,15 +1,12 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <assert.h>
+#ifndef SMOCK_H
+#define SMOCK_H
+
 #include <unistd.h>
-#include <errno.h>
-#include <sys/ptrace.h>
-#include <sys/wait.h>
-#include <sys/types.h>
+
+// TODO: Move to architecture-specefic header
 #include <sys/user.h>
-#include <sys/reg.h>
-#include <string.h>
+
+typedef long long int word_t;
 
 typedef struct user_regs_struct regs_t;
 #define SYSCALL_NR(regs) (regs).orig_rax
@@ -21,11 +18,40 @@ typedef struct user_regs_struct regs_t;
 #define SYSCALL_ARG4(regs) (regs).r8
 #define SYSCALL_ARG5(regs) (regs).r9
 
+typedef struct {
+    void (*entered)(pid_t pid, int syscall);
+    void (*exited)(pid_t pid, int syscall);
+} smock_syscall_hook;
+
+struct smock_context;
+
+struct smock_context* smock_child_process(char const *executable, char *const *args);
+int smock_set_syscall_handler(struct smock_context *ctx, int syscall_nr, smock_syscall_hook hook);
+void* smock_memcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes);
+void* smock_memcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes);
+void smock_dump_syscall(pid_t process, bool is_entry);
+int smock_run(struct smock_context *ctx);
+
+#endif  // SMOCK_H
+
+
+
+#ifdef SMOCK_IMPLEMENTATION
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <assert.h>
+#include <errno.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/reg.h>
+#include <string.h>
+
 #define BIT(n) (1 << (n))
 #define PTRACE_EVT(status) ((status) >> 16)
 #define DIEIF(condition, message) assert(( !(condition) ) && (message))
 
-typedef long long int word_t;
 
 typedef enum {
     SYSCALL_ARG_TYPE_SWORD,
@@ -92,19 +118,7 @@ static const syscall_def syscall_table[] = {
 };
 #define SYSCALL_NR_MAX ((sizeof(syscall_table) / sizeof(syscall_def)) - 1)
 
-typedef struct {
-    void (*entered)(pid_t pid, int syscall);
-    void (*exited)(pid_t pid, int syscall);
-} tracer_syscall_hook;
 
-typedef struct {
-    tracer_syscall_hook syscall_hooks[SYSCALL_NR_MAX + 1];
-} tracer_config;
-
-typedef struct {
-    pid_t tracee_pid;
-    tracer_config cfg;
-} tracer_context;
 
 typedef enum {
     TRACEE_EVT_INIT                 = BIT(1),
@@ -122,6 +136,15 @@ typedef struct {
         int exit_code;
     };
 } tracee_event;
+
+typedef struct {
+    smock_syscall_hook syscall_hooks[SYSCALL_NR_MAX + 1];
+} tracer_config;
+
+struct smock_context{
+    pid_t tracee_pid;
+    tracer_config cfg;
+};
 
 void print_syscall_arg_value(syscall_arg_type type, word_t value)
 {
@@ -174,7 +197,7 @@ static inline word_t get_syscall_arg_raw_value(regs_t *regs, int number)
     return -1;
 }
 
-void dump_syscall(pid_t process, bool is_entry)
+void smock_dump_syscall(pid_t process, bool is_entry)
 {
     regs_t regs;
     ptrace(PTRACE_GETREGS, process, NULL, &regs);
@@ -217,7 +240,7 @@ void dump_syscall(pid_t process, bool is_entry)
     if (!is_entry) printf("  ret: %lld\n", SYSCALL_RET(regs));
 }
 
-void *pmemcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes)
+void *smock_memcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes)
 {
     for(size_t i = 0; i < nbytes; i += sizeof(void*))
     {
@@ -227,7 +250,7 @@ void *pmemcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes)
     return dst;
 }
 
-void *pmemcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes)
+void *smock_memcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes)
 {
     for(size_t i = 0; i < nbytes; i += sizeof(void*))
     {
@@ -258,7 +281,7 @@ const char *tracee_evt_str(tracee_event_type type)
     };
 }
 
-int set_tracing_traps(tracer_context *ctx)
+int set_tracing_traps(struct smock_context *ctx)
 {
     int status = ptrace(PTRACE_SETOPTIONS, ctx->tracee_pid, NULL,
           PTRACE_O_TRACEEXEC 
@@ -279,7 +302,7 @@ ptrace_fail:
     return -1;
 }
 
-int expect_tracee_evt(tracer_context *ctx, tracee_event_type event_mask, tracee_event *catched_event)
+int expect_tracee_evt(struct smock_context *ctx, tracee_event_type event_mask, tracee_event *catched_event)
 {
     int tracee_status = -1;
     int status = set_tracing_traps(ctx);
@@ -349,7 +372,7 @@ int expect_tracee_evt(tracer_context *ctx, tracee_event_type event_mask, tracee_
     return (catched_event->type & event_mask) != 0 ? 0 : -1;
 }
 
-int expect_tracee_evt_or_exit(tracer_context *ctx, tracee_event_type event_mask, tracee_event *catched_evt)
+int expect_tracee_evt_or_exit(struct smock_context *ctx, tracee_event_type event_mask, tracee_event *catched_evt)
 {
     int status = expect_tracee_evt(ctx, event_mask, catched_evt);
     
@@ -374,7 +397,7 @@ int expect_tracee_evt_or_exit(tracer_context *ctx, tracee_event_type event_mask,
     }
 }
 
-void handle_tracee_syscall_evt(tracer_context *ctx)
+void handle_tracee_syscall_evt(struct smock_context *ctx)
 {
     const word_t syscall = ptrace(PTRACE_PEEKUSER, ctx->tracee_pid, (8 * ORIG_RAX), NULL);
     if (syscall < 0 || syscall > SYSCALL_NR_MAX)
@@ -383,7 +406,7 @@ void handle_tracee_syscall_evt(tracer_context *ctx)
         DIEIF(true, "^^");
     }
 
-    const tracer_syscall_hook *hook = &ctx->cfg.syscall_hooks[syscall];
+    const smock_syscall_hook *hook = &ctx->cfg.syscall_hooks[syscall];
     if (hook->entered)
     {
         hook->entered(ctx->tracee_pid, syscall);
@@ -422,7 +445,7 @@ void handle_tracee_syscall_evt(tracer_context *ctx)
     }
 }
 
-int run_tracer(tracer_context *ctx)
+int smock_run(struct smock_context *ctx)
 {
     int wait_status;
     waitpid(ctx->tracee_pid, &wait_status, 0);
@@ -486,10 +509,10 @@ int run_tracee(const char* exec_path, char* const* args)
     return execv(exec_path, args);
 }
 
-tracer_context* smock_child_process(char const *executable, char *const *args)
+struct smock_context* smock_child_process(char const *executable, char *const *args)
 {
-    tracer_context *ctx = malloc(sizeof(tracer_context));
-    memset(ctx, sizeof(tracer_context), 0);
+    struct smock_context *ctx = malloc(sizeof(struct smock_context));
+    memset(ctx, sizeof(struct smock_context), 0);
 
     pid_t tracee_pid = fork();
     
@@ -510,51 +533,16 @@ tracer_context* smock_child_process(char const *executable, char *const *args)
     }
 }
 
-
-
-void example_handle_write_entry(pid_t pid, int syscall)
+int smock_set_syscall_handler(struct smock_context *ctx, int syscall_nr, smock_syscall_hook hook)
 {
-    // Intercept stdout write
-    regs_t regs;
-    ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-    if (1 == SYSCALL_ARG0(regs))
+    if (syscall_nr >= SYSCALL_NR_MAX)
     {
-        word_t size = SYSCALL_ARG2(regs);
-
-        char *local_message = malloc(size); 
-        char *tracee_message_addr = (void*)SYSCALL_ARG1(regs);
-
-        pmemcpy_from(pid, local_message, tracee_message_addr, size);
-
-        printf("tracer: Got printf with size %lld: %s\n", size, local_message);
-        const char spoofed_message[16] = "spoofed ya\n";
-        
-        pmemcpy_to(pid, tracee_message_addr, spoofed_message, sizeof(spoofed_message));
-        SYSCALL_ARG2(regs) = (word_t)sizeof(spoofed_message);
-        ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+        return -1;
     }
+
+    ctx->cfg.syscall_hooks[syscall_nr] = hook;
+
+    return 0;
 }
 
-void example_handle_write_exit(pid_t pid, int syscall)
-{
-    if (1 == ptrace(PTRACE_PEEKUSER, pid, (8 * RDI)))
-    {
-        ptrace(PTRACE_POKEUSER, pid, (8 * RAX), 34);
-    }
-    dump_syscall(pid, false);
-}
-
-
-
-int main()
-{
-    tracer_context *ctx = smock_child_process("./test", NULL);
-
-    // Example with write(=1) syscall spoofing
-    ctx->cfg.syscall_hooks[1] = (tracer_syscall_hook){
-        .entered = example_handle_write_entry,
-        .exited = example_handle_write_exit
-    };
-
-    return run_tracer(ctx);
-}
+#endif  // SMOCK_IMPLEMENTATION

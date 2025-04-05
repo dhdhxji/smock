@@ -4,7 +4,6 @@
 #include <unistd.h>
 
 // TODO: Move to architecture-specefic header
-#include <sys/user.h>
 
 typedef long long int word_t;
 
@@ -47,6 +46,7 @@ int smock_run(struct smock_context *ctx);
 #include <sys/wait.h>
 #include <sys/reg.h>
 #include <string.h>
+#include "arch/arch.h"
 
 #define BIT(n) (1 << (n))
 #define PTRACE_EVT(status) ((status) >> 16)
@@ -89,32 +89,7 @@ typedef struct {
 //       represented by lua tables.
 //       In any case, I should revisit this table on later stages of development.
 static const syscall_def syscall_table[] = {
-    [1] = (syscall_def){
-        .name = "write",
-        .args = (syscall_arg_def[]){
-            {
-                .name = "fd",
-                .type = SYSCALL_ARG_TYPE_UWORD
-            },
-            {
-                .name = "buf",
-                .type = SYSCALL_ARG_TYPE_BYTE,
-                .flags = SYSCALL_ARG_FLAG_ARRAY,
-                .array_size_arg = 2
-            },
-            {
-                .name = "count",
-                .type = SYSCALL_ARG_TYPE_UWORD
-            },
-            { 0 }
-        },
-        .ret = {
-            .name = "bytes written",
-            .type = SYSCALL_ARG_TYPE_SWORD
-        }
-    },
-    // TODO
-    [400] = { 0 }
+    SMOCK_ARCH_SYSCALL_TABLE
 };
 #define SYSCALL_NR_MAX ((sizeof(syscall_table) / sizeof(syscall_def)) - 1)
 

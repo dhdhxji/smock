@@ -3,20 +3,18 @@
 
 #include <unistd.h>
 
-// TODO: Move to architecture-specefic header
-#include <sys/user.h>
+#include "arch/arch.h"
+#define SYSCALL_NR(regs) SMOCK_ARCH_SYSCALL_NR(regs)
+#define SYSCALL_RET(egs) SMOCK_ARCH_SYSCALL_RET(regs)
+#define SYSCALL_ARG0(regs) SMOCK_ARCH_SYSCALL_ARG0(regs)
+#define SYSCALL_ARG1(regs) SMOCK_ARCH_SYSCALL_ARG1(regs)
+#define SYSCALL_ARG2(regs) SMOCK_ARCH_SYSCALL_ARG2(regs)
+#define SYSCALL_ARG3(regs) SMOCK_ARCH_SYSCALL_ARG3(regs)
+#define SYSCALL_ARG4(regs) SMOCK_ARCH_SYSCALL_ARG4(regs)
+#define SYSCALL_ARG5(regs) SMOCK_ARCH_SYSCALL_ARG5(regs)
 
-typedef long long int word_t;
-
-typedef struct user_regs_struct regs_t;
-#define SYSCALL_NR(regs) (regs).orig_rax
-#define SYSCALL_RET(egs) (regs).rax
-#define SYSCALL_ARG0(regs) (regs).rdi
-#define SYSCALL_ARG1(regs) (regs).rsi
-#define SYSCALL_ARG2(regs) (regs).rdx
-#define SYSCALL_ARG3(regs) (regs).r10
-#define SYSCALL_ARG4(regs) (regs).r8
-#define SYSCALL_ARG5(regs) (regs).r9
+typedef smock_arch_word_t word_t;
+typedef smock_arch_regs_t regs_t;
 
 typedef struct {
     void (*entered)(pid_t pid, int syscall);
@@ -89,32 +87,7 @@ typedef struct {
 //       represented by lua tables.
 //       In any case, I should revisit this table on later stages of development.
 static const syscall_def syscall_table[] = {
-    [1] = (syscall_def){
-        .name = "write",
-        .args = (syscall_arg_def[]){
-            {
-                .name = "fd",
-                .type = SYSCALL_ARG_TYPE_UWORD
-            },
-            {
-                .name = "buf",
-                .type = SYSCALL_ARG_TYPE_BYTE,
-                .flags = SYSCALL_ARG_FLAG_ARRAY,
-                .array_size_arg = 2
-            },
-            {
-                .name = "count",
-                .type = SYSCALL_ARG_TYPE_UWORD
-            },
-            { 0 }
-        },
-        .ret = {
-            .name = "bytes written",
-            .type = SYSCALL_ARG_TYPE_SWORD
-        }
-    },
-    // TODO
-    [400] = { 0 }
+    SMOCK_ARCH_SYSCALL_TABLE
 };
 #define SYSCALL_NR_MAX ((sizeof(syscall_table) / sizeof(syscall_def)) - 1)
 

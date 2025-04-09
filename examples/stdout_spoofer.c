@@ -39,7 +39,7 @@ void example_handle_write_exit(pid_t pid, int syscall)
         SYSCALL_RET(regs) = 34;
         ptrace(PTRACE_SETREGS, pid, NULL, &regs);
     }
-    // smock_dump_syscall(pid, false);
+    smock_dump_syscall(pid, false);
 }
 
 
@@ -49,7 +49,7 @@ int main(int argc, char const **argv)
     if (argc != 2)
     {
         printf("Usage: %s (executable)\n", argv[0]);
-	return -1;
+        return -1;
     }
 
     struct smock_context *ctx = smock_child_process(argv[1], NULL);

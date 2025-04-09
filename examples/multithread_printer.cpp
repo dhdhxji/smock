@@ -7,7 +7,7 @@
 void printer(std::string message, std::mutex &mutex)
 {
     std::lock_guard lock{mutex};
-    std::cout << "Tracee: " << message << std::endl;
+    std::cout << "Tracee: Hello, I am thread #" << message << std::endl;
 }
 
 static constexpr int numThreads = 5;

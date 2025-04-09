@@ -25,8 +25,8 @@ struct smock_context;
 
 struct smock_context* smock_child_process(char const *executable, char *const *args);
 int smock_set_syscall_handler(struct smock_context *ctx, int syscall_nr, smock_syscall_hook hook);
-void* smock_memcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes);
-void* smock_memcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes);
+word_t smock_memcpy_to(pid_t pid, word_t tracee_dst_addr, const void *src, size_t nbytes);
+void* smock_memcpy_from(pid_t pid, void *dst, word_t tracee_src_addr, size_t nbytes);
 void smock_dump_syscall(pid_t process, bool is_entry);
 int smock_run(struct smock_context *ctx);
 
@@ -46,10 +46,18 @@ int smock_run(struct smock_context *ctx);
 #include <sys/reg.h>
 #include <string.h>
 
+#define STB_DS_IMPLEMENTATION
+#include "stb_ds.h"
+
 #define BIT(n) (1 << (n))
 #define PTRACE_EVT(status) ((status) >> 16)
 #define DIEIF(condition, message) assert(( !(condition) ) && (message))
 
+#ifdef SMOCK_DEBUG
+#define DBGMSG(...) printf(__VA_ARGS__)
+#else
+#define DBGMSG(...)
+#endif
 
 typedef enum {
     SYSCALL_ARG_TYPE_SWORD,
@@ -98,15 +106,19 @@ typedef enum {
     TRACEE_EVT_SYSCALL              = BIT(2),
     TRACEE_EVT_EXEC_NOTIFICATION    = BIT(3),
     TRACEE_EVT_SIGNALED             = BIT(4),
-    TRACEE_EVT_EXITED               = BIT(5),
-    TRACEE_EVT_DISAPPEARED          = BIT(6)
+    TRACEE_EVT_EXITING              = BIT(5),
+    TRACEE_EVT_EXITED               = BIT(6),
+    TRACEE_EVT_DISAPPEARED          = BIT(7),
+    TRACEE_EVT_NEW_THREAD           = BIT(8),
+    TRACEE_EVT_ALL                  = (TRACEE_EVT_NEW_THREAD << 1) - 1
 } tracee_event_type;
 
 typedef struct {
     tracee_event_type type;
     union {
-        int termination_signal;
-        int exit_code;
+        word_t termination_signal;
+        word_t exit_code;
+        pid_t pid;
     };
 } tracee_event;
 
@@ -114,9 +126,29 @@ typedef struct {
     smock_syscall_hook syscall_hooks[SYSCALL_NR_MAX + 1];
 } tracer_config;
 
+typedef enum {
+    STATE_IDLE,
+    STATE_ENTERED_SYSCALL
+} tracee_state_type;
+
+typedef struct {
+    tracee_state_type state;
+    union {
+        int syscall_nr;
+    };
+} tracee_ctx;
+
+typedef struct {
+    pid_t key;
+    tracee_ctx value;
+} tracee_ctx_map;
+
 struct smock_context{
     pid_t tracee_pid;
+    size_t num_active_threads;
     tracer_config cfg;
+
+    tracee_ctx_map *tracee_ctxs;
 };
 
 void print_syscall_arg_value(syscall_arg_type type, word_t value)
@@ -184,53 +216,77 @@ void smock_dump_syscall(pid_t process, bool is_entry)
 
     const syscall_def *syscall = &syscall_table[syscall_nr];
     
-    printf("syscall %s %s(%d)\n", is_entry ? "entry" : "exit", syscall->name, syscall_nr);
+    printf("(%d): syscall %s %s(%d)\n", process, is_entry ? "entry" : "exit", syscall->name, syscall_nr);
     
     const syscall_arg_def zero_arg = { 0 };
-    for (int i = 0; memcmp(&zero_arg, &syscall->args[i], sizeof(zero_arg)); ++i)
-    {
-        const syscall_arg_def *arg = &syscall->args[i];
-        word_t raw_value = get_syscall_arg_raw_value(&regs, i);
+    // TODO: fix syscall definitions to include zero-terminated arg
+    // for (int i = 0; memcmp(&zero_arg, &syscall->args[i], sizeof(zero_arg)); ++i)
+    // {
+    //     const syscall_arg_def *arg = &syscall->args[i];
+    //     word_t raw_value = get_syscall_arg_raw_value(&regs, i);
   
-        if (SYSCALL_ARG_FLAG_ARRAY & arg->flags)
-        {
-            const word_t size = get_syscall_arg_raw_value(&regs, arg->array_size_arg);
-            printf("  %d: %p: Array of size %llu\n", i, (void*)raw_value, size);
-        }
-        else if (SYSCALL_ARG_FLAG_POINTER & arg->flags)
-        {
-            printf("  %d: %lld: Pointer\n", i, raw_value);
-        }
-        else
-        {
-            //printf("  %d: %lld: Primitive value (probably)\n", i, raw_value);
-            printf("  %d: ", i); 
-            print_syscall_arg_value(arg->type, raw_value);
-            printf("\n");
-        }
-    }
+    //     if (SYSCALL_ARG_FLAG_ARRAY & arg->flags)
+    //     {
+    //         const word_t size = get_syscall_arg_raw_value(&regs, arg->array_size_arg);
+    //         printf("  %d: %p: Array of size %llu\n", i, (void*)raw_value, size);
+    //     }
+    //     else if (SYSCALL_ARG_FLAG_POINTER & arg->flags)
+    //     {
+    //         printf("  %d: %lld: Pointer\n", i, raw_value);
+    //     }
+    //     else
+    //     {
+    //         //printf("  %d: %lld: Primitive value (probably)\n", i, raw_value);
+    //         printf("  %d: ", i); 
+    //         print_syscall_arg_value(arg->type, raw_value);
+    //         printf("\n");
+    //     }
+    // }
     
     if (!is_entry) printf("  ret: %lld\n", SYSCALL_RET(regs));
 }
 
-void *smock_memcpy_from(pid_t pid, void *dst, const void *src, size_t nbytes)
+void *smock_memcpy_from(pid_t pid, void *dst, word_t tracee_src_addr, size_t nbytes)
 {
-    for(size_t i = 0; i < nbytes; i += sizeof(void*))
+    const word_t complete_word_count = nbytes / sizeof(word_t);
+    for (int word = 0; word < complete_word_count; word++)
     {
-        ((word_t *)dst)[i / sizeof(void*)] = ptrace(PTRACE_PEEKTEXT, pid, src + i, NULL);
+        const word_t offset = word * sizeof(word_t);
+        char *dst_word = (char*)dst + offset;
+        *(word_t*)dst_word = ptrace(PTRACE_PEEKTEXT, pid, tracee_src_addr + offset, NULL);
+    }
+
+    if (nbytes % sizeof(word_t) != 0)
+    {
+        const word_t offset = nbytes - sizeof(word_t);
+        const word_t bytes_left = nbytes - offset;
+        word_t last_word = ptrace(PTRACE_PEEKTEXT, pid,  tracee_src_addr + offset);
+        memcpy((char*)dst + offset, &last_word, bytes_left);
     }
 
     return dst;
 }
 
-void *smock_memcpy_to(pid_t pid, void *dst, const void *src, size_t nbytes)
+word_t smock_memcpy_to(pid_t pid, word_t tracee_dst_addr, const void *src, size_t nbytes)
 {
-    for(size_t i = 0; i < nbytes; i += sizeof(void*))
+    const word_t complete_word_count = nbytes / sizeof(word_t);
+    for (int word = 0; word < complete_word_count; word++)
     {
-        long ret = ptrace(PTRACE_POKETEXT, pid, dst + i, ((word_t *)src)[i / sizeof(void*)]);
+        const word_t offset = word * sizeof(word_t);
+        char *src_word = (char*)src + offset;
+        ptrace(PTRACE_POKETEXT, pid, tracee_dst_addr + offset, *(word_t*)src_word);
     }
 
-    return dst;
+    if (nbytes % sizeof(word_t) != 0)
+    {
+        const word_t offset = nbytes - sizeof(word_t);
+        const word_t bytes_left = nbytes - offset;
+        word_t last_word = ptrace(PTRACE_PEEKTEXT, pid,  tracee_dst_addr + offset);
+        memcpy(&last_word, (char*)src + offset, bytes_left);
+        ptrace(PTRACE_POKETEXT, pid, tracee_dst_addr + offset, last_word);
+    }
+
+    return tracee_dst_addr;
 }
 
 const char *tracee_evt_str(tracee_event_type type)
@@ -245,61 +301,59 @@ const char *tracee_evt_str(tracee_event_type type)
         return "TRACEE_EVT_EXEC_NOTIFICATION";
     case TRACEE_EVT_SIGNALED:
         return "TRACEE_EVT_SIGNALED";
+    case TRACEE_EVT_EXITING:
+        return "TRACEE_EVT_EXITING";
     case TRACEE_EVT_EXITED:
         return "TRACEE_EVT_EXITED";
     case TRACEE_EVT_DISAPPEARED:
         return "TRACEE_EVT_DISAPPEARED";
+    case TRACEE_EVT_NEW_THREAD:
+        return "TRACEE_EVT_NEW_THREAD";	
     default:
         return "UNKNOWN";
     };
 }
 
-int set_tracing_traps(struct smock_context *ctx)
+int set_tracing_traps(pid_t pid)
 {
-    int status = ptrace(PTRACE_SETOPTIONS, ctx->tracee_pid, NULL,
+    int status = ptrace(PTRACE_SETOPTIONS, pid, NULL,
           PTRACE_O_TRACEEXEC 
         | PTRACE_O_TRACEEXIT 
         | PTRACE_O_TRACESYSGOOD
+        | PTRACE_O_TRACECLONE
     ); 
     if (status) goto ptrace_fail;
     
-    status = ptrace(PTRACE_SYSCALL, ctx->tracee_pid, NULL, 0);
+    status = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
     if (status) goto ptrace_fail;
 
     return status;
 
 ptrace_fail:
-    printf("ptrace returned an error %d, errno=%d\n", status, errno);
+    printf("(%d) ptrace returned an error %d, errno=%d\n", pid, status, errno);
     DIEIF(true, "^^");
 
     return -1;
 }
 
-int expect_tracee_evt(struct smock_context *ctx, tracee_event_type event_mask, tracee_event *catched_event)
+int expect_tracee_evt(struct smock_context *ctx, pid_t pid, tracee_event_type event_mask, tracee_event *catched_event)
 {
     int tracee_status = -1;
-    int status = set_tracing_traps(ctx);
-    if (status)
-    {
-        printf("Failed to set tracing traps %d\n", status);
-        return -1;
-    }
+    int producer_pid = waitpid(pid, &tracee_status, 0);
 
-    status = waitpid(ctx->tracee_pid, &tracee_status, 0);
-
-    if (ECHILD == status)
+    if (ECHILD == producer_pid)
     {
         catched_event->type = TRACEE_EVT_DISAPPEARED;
     }
-    else if (ctx->tracee_pid != status)
+    else if ((pid != producer_pid) && (pid != -1))
     {
-        printf("Unhandled waitpid error %d\n", status);
+        printf("Unhandled waitpid error %d\n", producer_pid);
         DIEIF(true, "^^");
     }
     else if (WIFEXITED(tracee_status))
     {
         catched_event->type = TRACEE_EVT_EXITED;
-        catched_event->termination_signal = WEXITSTATUS(tracee_status);
+        catched_event->exit_code = WEXITSTATUS(tracee_status);
     }
     else if (WIFSIGNALED(tracee_status))
     {
@@ -318,12 +372,23 @@ int expect_tracee_evt(struct smock_context *ctx, tracee_event_type event_mask, t
             }
             else if (PTRACE_EVT(tracee_status) == PTRACE_EVENT_EXIT)
             {
-                catched_event->type = TRACEE_EVT_EXITED;
-                ptrace(PTRACE_GETEVENTMSG, ctx->tracee_pid, NULL, &catched_event->exit_code);
+                catched_event->type = TRACEE_EVT_EXITING;
+                ptrace(PTRACE_GETEVENTMSG, producer_pid, NULL, &catched_event->exit_code);
+            }
+            else if (PTRACE_EVT(tracee_status) == PTRACE_EVENT_CLONE)
+            {
+                word_t new_thread_pid = -1;
+                ptrace(PTRACE_GETEVENTMSG, producer_pid, NULL, &new_thread_pid);
+                catched_event->type = TRACEE_EVT_NEW_THREAD;
+                catched_event->pid = new_thread_pid;
             }
             else if (WSTOPSIG(tracee_status) & BIT(7))
             {
                 catched_event->type = TRACEE_EVT_SYSCALL;
+            }
+            else 
+            {
+                printf("Got unexpected SIGTRAP evt: %x\n", stop_signal);
             }
             break;
 
@@ -342,37 +407,39 @@ int expect_tracee_evt(struct smock_context *ctx, tracee_event_type event_mask, t
         DIEIF(true, "^^");
     }
     
-    return (catched_event->type & event_mask) != 0 ? 0 : -1;
-}
 
-int expect_tracee_evt_or_exit(struct smock_context *ctx, tracee_event_type event_mask, tracee_event *catched_evt)
-{
-    int status = expect_tracee_evt(ctx, event_mask, catched_evt);
-    
-    if (TRACEE_EVT_EXITED == catched_evt->type)
+    if (catched_event->type & event_mask == 0)
     {
-        printf("Tracee exited with exit code %d\n", catched_evt->exit_code);
-        exit(0);
-    }
-    else if (TRACEE_EVT_SIGNALED == catched_evt->type)
-    {
-        printf("Tracee has been terminated by signal %d\n", catched_evt->termination_signal);
-        exit(0);
-    }
-    else if (TRACEE_EVT_DISAPPEARED == catched_evt->type)
-    {
-        printf("Tracee disappeared\n");
+        printf("Critical: Expectected one of following events:\n");
+        for (tracee_event_type event = 1; event < TRACEE_EVT_ALL; event <<= 1)
+        {
+            if (event & event_mask) printf(" - %s\n", tracee_evt_str(event));
+        }
+        printf("Got: %s\n", tracee_evt_str(catched_event->type));
         exit(1);
     }
-    else
-    {
-        return status;
-    }
+
+    return producer_pid;
 }
 
-void handle_tracee_syscall_evt(struct smock_context *ctx)
+void handle_tracee_new_thread_evt(struct smock_context *ctx, pid_t parent, pid_t pid)
 {
-    const word_t syscall = ptrace(PTRACE_PEEKUSER, ctx->tracee_pid, (8 * ORIG_RAX), NULL);
+    DBGMSG("(%d): Started\n", pid);
+    ctx->num_active_threads++;
+
+    tracee_ctx tracee_ctx = {
+        .state = STATE_IDLE
+    };
+
+    hmput(ctx->tracee_ctxs, pid, tracee_ctx);
+}
+
+void handle_tracee_syscall_evt(struct smock_context *ctx, pid_t pid)
+{
+    regs_t regs = {}; 
+    int status = ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+    const word_t syscall = SYSCALL_NR(regs);
+
     if (syscall < 0 || syscall > SYSCALL_NR_MAX)
     {
         printf("Invaliid syscall number %lld, there is nothing we can do in this hopeless situation...\n", syscall);
@@ -380,97 +447,97 @@ void handle_tracee_syscall_evt(struct smock_context *ctx)
     }
 
     const smock_syscall_hook *hook = &ctx->cfg.syscall_hooks[syscall];
-    if (hook->entered)
-    {
-        hook->entered(ctx->tracee_pid, syscall);
-    }
 
-    tracee_event event;
-    int status = expect_tracee_evt(
-        ctx,
-        TRACEE_EVT_SYSCALL | TRACEE_EVT_EXEC_NOTIFICATION | TRACEE_EVT_EXITED,
-        &event);
+    tracee_ctx *tracee_ctx = &(hmgetp(ctx->tracee_ctxs, pid)->value);
+    if (tracee_ctx->state == STATE_IDLE)
+    {
+#ifdef SMOCK_DEBUG
+        smock_dump_syscall(pid, true);
+#endif
 
-    if (status)
-    {
-        printf("Expected syscall end event, exec notification or exit event got %s\n", tracee_evt_str(event.type));
-        DIEIF(true, "^^");
-    }
+        tracee_ctx->state = STATE_ENTERED_SYSCALL;
+        tracee_ctx->syscall_nr = syscall;
 
-    if (TRACEE_EVT_EXEC_NOTIFICATION == event.type)
-    {
-        status = expect_tracee_evt(ctx, TRACEE_EVT_SYSCALL, &event);
-        if (status)
-        {
-            printf("Expected syscall end event, got %s\n", tracee_evt_str(event.type));
-            DIEIF(true, "^^");
-        }
+        if (hook->entered) hook->entered(pid, syscall);
     }
-    else if (TRACEE_EVT_EXITED == event.type)
+    else if (tracee_ctx->state == STATE_ENTERED_SYSCALL)
     {
-        printf("Tracee exited by exit(%d) syscall\n", event.exit_code);
-        exit(0);
-    }
+#ifdef SMOCK_DEBUG
+        smock_dump_syscall(pid, false);
+#endif
 
-    if (hook->exited)
+        tracee_ctx->state = STATE_IDLE;
+
+        if (hook->exited) hook->exited(pid, syscall);
+    }
+    else
     {
-        hook->exited(ctx->tracee_pid, syscall);
+        printf("Unknown state %d\n", (int)tracee_ctx->state);
+        exit(1);
     }
 }
 
 int smock_run(struct smock_context *ctx)
 {
-    int wait_status;
-    waitpid(ctx->tracee_pid, &wait_status, 0);
-    DIEIF(!WIFSTOPPED(wait_status) || WSTOPSIG(wait_status) != SIGSTOP, "Expected SIGSTOP");
+    tracee_event event;
+    expect_tracee_evt(ctx, ctx->tracee_pid, TRACEE_EVT_INIT, &event);
 
     // Our own exec doesn't counts as a traceable/interceptable syscall
-    tracee_event event;
-    int status = expect_tracee_evt(ctx, TRACEE_EVT_SYSCALL, &event);
-    if (status)
-    {
-        printf("Expected exec sysall entry event, got %s\n", tracee_evt_str(event.type));
-        exit(1);
-    }
+    int status = set_tracing_traps(ctx->tracee_pid);
+    if (status) goto set_traps_error;
 
-    status = expect_tracee_evt(ctx, TRACEE_EVT_EXEC_NOTIFICATION, &event);
-    if (status)
-    {
-        printf("Expected exec notification, got %s\n", tracee_evt_str(event.type));
-        exit(1);
-    }
+    expect_tracee_evt(ctx, ctx->tracee_pid, TRACEE_EVT_SYSCALL, &event);
 
-    status = expect_tracee_evt(ctx, TRACEE_EVT_SYSCALL, &event);
-    if (status)
-    {
-        printf("Expected exec sysall exit event, got %s\n", tracee_evt_str(event.type));
-        exit(1);
-    }
+    status = set_tracing_traps(ctx->tracee_pid);
+    if (status) goto set_traps_error;
 
-    tracee_event_type all_event_mask = 
-        TRACEE_EVT_SYSCALL;
+    expect_tracee_evt(ctx, ctx->tracee_pid, TRACEE_EVT_EXEC_NOTIFICATION, &event);
 
-    for(;;)
+    status = set_tracing_traps(ctx->tracee_pid);
+    if (status) goto set_traps_error;
+
+    expect_tracee_evt(ctx, ctx->tracee_pid, TRACEE_EVT_SYSCALL, &event);
+
+    status = set_tracing_traps(ctx->tracee_pid);
+    if (status) goto set_traps_error;
+
+    while (ctx->num_active_threads != 0)
     {
-        status = expect_tracee_evt_or_exit(ctx, all_event_mask, &event);
-        if (status)
-        {
-            // This should no happen as all of possible events should be covered in this loop
-            printf("Unexpected tracee event %d\n", event.type);
-            exit(1);
-        }
+        pid_t pid = expect_tracee_evt(ctx, -1, TRACEE_EVT_ALL, &event);
+        DBGMSG("(%d): Event %s\n", pid, tracee_evt_str(event.type));
 
         switch(event.type)
         {
         case TRACEE_EVT_SYSCALL:
-            handle_tracee_syscall_evt(ctx);
+            handle_tracee_syscall_evt(ctx, pid);
             break;
-        default:
-            printf("Received tracee event %s\n", tracee_evt_str(event.type));
+
+        case TRACEE_EVT_NEW_THREAD:
+            handle_tracee_new_thread_evt(ctx, pid, event.pid);
+            break;
+
+        case TRACEE_EVT_INIT:
+        case TRACEE_EVT_EXEC_NOTIFICATION:
+        case TRACEE_EVT_EXITING:
+            //TODO
+            break;
+
+        case TRACEE_EVT_SIGNALED:
+        case TRACEE_EVT_EXITED:
+        case TRACEE_EVT_DISAPPEARED:
+            ctx->num_active_threads--;
+            DBGMSG("(%d) exited with code %lld\n", pid, event.exit_code);
+            continue;
         };
+
+        set_tracing_traps(pid);
     }
 
     return 0;
+
+set_traps_error:
+    printf("Unable to set up child traps with error: %d\n", status);
+    exit(-1);
 }
 
 int run_tracee(const char* exec_path, char* const* args)
@@ -502,13 +569,20 @@ struct smock_context* smock_child_process(char const *executable, char *const *a
     else
     {
         ctx->tracee_pid = tracee_pid;
+        ctx->num_active_threads = 1;
+        tracee_ctx tracee_ctx = {
+            .state = STATE_IDLE,
+        };
+        hmput(ctx->tracee_ctxs, tracee_pid, tracee_ctx);
         return ctx;
     }
+
+    return ctx;
 }
 
 int smock_set_syscall_handler(struct smock_context *ctx, int syscall_nr, smock_syscall_hook hook)
 {
-    if (syscall_nr >= SYSCALL_NR_MAX)
+    if (syscall_nr >= SYSCALL_NR_MAX || syscall_nr < 0)
     {
         return -1;
     }

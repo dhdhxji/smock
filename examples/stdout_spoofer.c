@@ -6,7 +6,19 @@
 #define SMOCK_IMPLEMENTATION
 #include "../smock.h"
 
-const char spoofed_message[16] = "Spoofed ya!\n";
+const char spoofed_message[] = "Spoofed ya!\n";
+
+typedef struct {
+    char *message;
+    word_t length;
+} sniffed_message;
+
+typedef struct {
+    pid_t key;
+    sniffed_message value;
+} sniffed_message_map;
+
+sniffed_message_map *sniffed_messages = NULL;
 
 void example_handle_write_entry(pid_t pid, int syscall)
 {
@@ -16,13 +28,14 @@ void example_handle_write_entry(pid_t pid, int syscall)
     if (1 == SYSCALL_ARG0(regs))
     {
         word_t size = SYSCALL_ARG2(regs);
+        word_t tracee_message_addr = SYSCALL_ARG1(regs);
 
-        char *local_message = malloc(size); 
-        char *tracee_message_addr = (void*)SYSCALL_ARG1(regs);
+        char *original_message = malloc(size); 
+        smock_memcpy_from(pid, original_message, tracee_message_addr, size);
+        sniffed_message msg = {original_message, size};
+        hmput(sniffed_messages, pid, msg);
 
-        smock_memcpy_from(pid, local_message, tracee_message_addr, size);
-
-        printf("tracer: Got printf with size %lld: %s\n", size, local_message);
+        printf("tracer: Got printf with size %lld: %s\n", size, original_message);
         
         smock_memcpy_to(pid, tracee_message_addr, spoofed_message, sizeof(spoofed_message));
         SYSCALL_ARG2(regs) = (word_t)sizeof(spoofed_message);
@@ -36,10 +49,17 @@ void example_handle_write_exit(pid_t pid, int syscall)
     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
     if (1 == SYSCALL_ARG0(regs))
     {
-        SYSCALL_RET(regs) = 34;
+        word_t tracee_message_addr = SYSCALL_ARG1(regs);
+        sniffed_message msg = hmgetp(sniffed_messages, pid)->value;
+
+        smock_memcpy_to(pid, tracee_message_addr, msg.message, msg.length);
+        SYSCALL_RET(regs) = msg.length;
         ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+
+        free(msg.message);
+        hmdel(sniffed_messages, pid);
     }
-    // smock_dump_syscall(pid, false);
+    smock_dump_syscall(pid, false);
 }
 
 
@@ -49,7 +69,7 @@ int main(int argc, char const **argv)
     if (argc != 2)
     {
         printf("Usage: %s (executable)\n", argv[0]);
-	return -1;
+        return -1;
     }
 
     struct smock_context *ctx = smock_child_process(argv[1], NULL);

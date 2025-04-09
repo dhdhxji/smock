@@ -2,6 +2,8 @@
 
 int main()
 {
-    printf("i am a test subject. Please help \n");
+    const char message[] = "i am a test subject. Please help \n";
+    printf(message);
+    printf(message);
     return 0;
 }

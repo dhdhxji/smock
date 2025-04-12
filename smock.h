@@ -207,41 +207,40 @@ void smock_dump_syscall(pid_t process, bool is_entry)
     regs_t regs;
     ptrace(PTRACE_GETREGS, process, NULL, &regs);
 
-    int syscall_nr = SYSCALL_NR(regs);
-    if (syscall_nr < 0 || syscall_nr > SYSCALL_NR_MAX)
+    word_t syscall_nr = SYSCALL_NR(regs);
+    if (syscall_nr < 0 || syscall_nr > (word_t)SYSCALL_NR_MAX)
     {
-        printf("Invalid syscall number %d\n", syscall_nr);
+        printf("Invalid syscall number %lld\n", syscall_nr);
         return;
     }
 
     const syscall_def *syscall = &syscall_table[syscall_nr];
-    
-    printf("(%d): syscall %s %s(%d)\n", process, is_entry ? "entry" : "exit", syscall->name, syscall_nr);
-    
+
+    printf("(%d): syscall %s %s(%lld)\n", process, is_entry ? "entry" : "exit", syscall->name, syscall_nr);
+
     const syscall_arg_def zero_arg = { 0 };
-    // TODO: fix syscall definitions to include zero-terminated arg
-    // for (int i = 0; memcmp(&zero_arg, &syscall->args[i], sizeof(zero_arg)); ++i)
-    // {
-    //     const syscall_arg_def *arg = &syscall->args[i];
-    //     word_t raw_value = get_syscall_arg_raw_value(&regs, i);
+    for (int i = 0; memcmp(&zero_arg, &syscall->args[i], sizeof(zero_arg)); ++i)
+    {
+        const syscall_arg_def *arg = &syscall->args[i];
+        word_t raw_value = get_syscall_arg_raw_value(&regs, i);
   
-    //     if (SYSCALL_ARG_FLAG_ARRAY & arg->flags)
-    //     {
-    //         const word_t size = get_syscall_arg_raw_value(&regs, arg->array_size_arg);
-    //         printf("  %d: %p: Array of size %llu\n", i, (void*)raw_value, size);
-    //     }
-    //     else if (SYSCALL_ARG_FLAG_POINTER & arg->flags)
-    //     {
-    //         printf("  %d: %lld: Pointer\n", i, raw_value);
-    //     }
-    //     else
-    //     {
-    //         //printf("  %d: %lld: Primitive value (probably)\n", i, raw_value);
-    //         printf("  %d: ", i); 
-    //         print_syscall_arg_value(arg->type, raw_value);
-    //         printf("\n");
-    //     }
-    // }
+        if (SYSCALL_ARG_FLAG_ARRAY & arg->flags)
+        {
+            const word_t size = get_syscall_arg_raw_value(&regs, arg->array_size_arg);
+            printf("  %d: %p: Array of size %llu\n", i, (void*)raw_value, size);
+        }
+        else if (SYSCALL_ARG_FLAG_POINTER & arg->flags)
+        {
+            printf("  %d: %lld: Pointer\n", i, raw_value);
+        }
+        else
+        {
+            //printf("  %d: %lld: Primitive value (probably)\n", i, raw_value);
+            printf("  %d: ", i); 
+            print_syscall_arg_value(arg->type, raw_value);
+            printf("\n");
+        }
+    }
     
     if (!is_entry) printf("  ret: %lld\n", SYSCALL_RET(regs));
 }
@@ -336,7 +335,7 @@ ptrace_fail:
     return -1;
 }
 
-int expect_tracee_evt(struct smock_context *ctx, pid_t pid, tracee_event_type event_mask, tracee_event *catched_event)
+int expect_tracee_evt(pid_t pid, tracee_event_type event_mask, tracee_event *catched_event)
 {
     int tracee_status = -1;
     int producer_pid = waitpid(pid, &tracee_status, 0);
@@ -408,7 +407,7 @@ int expect_tracee_evt(struct smock_context *ctx, pid_t pid, tracee_event_type ev
     }
     
 
-    if (catched_event->type & event_mask == 0)
+    if (catched_event->type & (event_mask == 0))
     {
         printf("Critical: Expectected one of following events:\n");
         for (tracee_event_type event = 1; event < TRACEE_EVT_ALL; event <<= 1)
@@ -422,25 +421,13 @@ int expect_tracee_evt(struct smock_context *ctx, pid_t pid, tracee_event_type ev
     return producer_pid;
 }
 
-void handle_tracee_new_thread_evt(struct smock_context *ctx, pid_t parent, pid_t pid)
-{
-    DBGMSG("(%d): Started\n", pid);
-    ctx->num_active_threads++;
-
-    tracee_ctx tracee_ctx = {
-        .state = STATE_IDLE
-    };
-
-    hmput(ctx->tracee_ctxs, pid, tracee_ctx);
-}
-
 void handle_tracee_syscall_evt(struct smock_context *ctx, pid_t pid)
 {
-    regs_t regs = {}; 
-    int status = ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+    regs_t regs = { 0 }; 
+    ptrace(PTRACE_GETREGS, pid, NULL, &regs);
     const word_t syscall = SYSCALL_NR(regs);
 
-    if (syscall < 0 || syscall > SYSCALL_NR_MAX)
+    if (syscall < 0 || syscall > (word_t)SYSCALL_NR_MAX)
     {
         printf("Invaliid syscall number %lld, there is nothing we can do in this hopeless situation...\n", syscall);
         DIEIF(true, "^^");
@@ -448,7 +435,13 @@ void handle_tracee_syscall_evt(struct smock_context *ctx, pid_t pid)
 
     const smock_syscall_hook *hook = &ctx->cfg.syscall_hooks[syscall];
 
-    tracee_ctx *tracee_ctx = &(hmgetp(ctx->tracee_ctxs, pid)->value);
+    tracee_ctx_map *tracee_ctx_map = hmgetp_null(ctx->tracee_ctxs, pid);
+    if (tracee_ctx_map == NULL)
+    {
+        printf("No context entry in map for pid %d\n", pid);
+        DIEIF(true, "^^");
+    }
+    tracee_ctx *tracee_ctx = &(tracee_ctx_map->value);
     if (tracee_ctx->state == STATE_IDLE)
     {
 #ifdef SMOCK_DEBUG
@@ -480,30 +473,30 @@ void handle_tracee_syscall_evt(struct smock_context *ctx, pid_t pid)
 int smock_run(struct smock_context *ctx)
 {
     tracee_event event;
-    expect_tracee_evt(ctx, ctx->tracee_pid, TRACEE_EVT_INIT, &event);
+    expect_tracee_evt(ctx->tracee_pid, TRACEE_EVT_INIT, &event);
 
     // Our own exec doesn't counts as a traceable/interceptable syscall
     int status = set_tracing_traps(ctx->tracee_pid);
     if (status) goto set_traps_error;
 
-    expect_tracee_evt(ctx, ctx->tracee_pid, TRACEE_EVT_SYSCALL, &event);
+    expect_tracee_evt(ctx->tracee_pid, TRACEE_EVT_SYSCALL, &event);
 
     status = set_tracing_traps(ctx->tracee_pid);
     if (status) goto set_traps_error;
 
-    expect_tracee_evt(ctx, ctx->tracee_pid, TRACEE_EVT_EXEC_NOTIFICATION, &event);
+    expect_tracee_evt(ctx->tracee_pid, TRACEE_EVT_EXEC_NOTIFICATION, &event);
 
     status = set_tracing_traps(ctx->tracee_pid);
     if (status) goto set_traps_error;
 
-    expect_tracee_evt(ctx, ctx->tracee_pid, TRACEE_EVT_SYSCALL, &event);
+    expect_tracee_evt(ctx->tracee_pid, TRACEE_EVT_SYSCALL, &event);
 
     status = set_tracing_traps(ctx->tracee_pid);
     if (status) goto set_traps_error;
 
     while (ctx->num_active_threads != 0)
     {
-        pid_t pid = expect_tracee_evt(ctx, -1, TRACEE_EVT_ALL, &event);
+        pid_t pid = expect_tracee_evt(-1, TRACEE_EVT_ALL, &event);
         DBGMSG("(%d): Event %s\n", pid, tracee_evt_str(event.type));
 
         switch(event.type)
@@ -513,7 +506,12 @@ int smock_run(struct smock_context *ctx)
             break;
 
         case TRACEE_EVT_NEW_THREAD:
-            handle_tracee_new_thread_evt(ctx, pid, event.pid);
+            DBGMSG("(%d): Started\n", event.pid);
+            ctx->num_active_threads++;
+            tracee_ctx tracee_ctx = {
+                .state = STATE_IDLE
+            };
+            hmput(ctx->tracee_ctxs, event.pid, tracee_ctx);
             break;
 
         case TRACEE_EVT_INIT:
@@ -525,9 +523,14 @@ int smock_run(struct smock_context *ctx)
         case TRACEE_EVT_SIGNALED:
         case TRACEE_EVT_EXITED:
         case TRACEE_EVT_DISAPPEARED:
-            ctx->num_active_threads--;
             DBGMSG("(%d) exited with code %lld\n", pid, event.exit_code);
+            ctx->num_active_threads--;
+             (void)hmdel(ctx->tracee_ctxs, pid);
             continue;
+
+        default:
+            DBGMSG("Unknown event %u\n", event.type);
+            DIEIF(true, "^^");
         };
 
         set_tracing_traps(pid);
@@ -552,7 +555,7 @@ int run_tracee(const char* exec_path, char* const* args)
 struct smock_context* smock_child_process(char const *executable, char *const *args)
 {
     struct smock_context *ctx = malloc(sizeof(struct smock_context));
-    memset(ctx, sizeof(struct smock_context), 0);
+    memset(ctx, 0, sizeof(struct smock_context));
 
     pid_t tracee_pid = fork();
     
@@ -582,7 +585,7 @@ struct smock_context* smock_child_process(char const *executable, char *const *a
 
 int smock_set_syscall_handler(struct smock_context *ctx, int syscall_nr, smock_syscall_hook hook)
 {
-    if (syscall_nr >= SYSCALL_NR_MAX || syscall_nr < 0)
+    if (syscall_nr >= (word_t)SYSCALL_NR_MAX || syscall_nr < 0)
     {
         return -1;
     }

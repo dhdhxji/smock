@@ -22,21 +22,22 @@ sniffed_message_map *sniffed_messages = NULL;
 
 void example_handle_write_entry(pid_t pid, int syscall)
 {
-    // Intercept stdout write
+    (void) syscall;
+
     regs_t regs;
     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
     if (1 == SYSCALL_ARG0(regs))
     {
-        word_t size = SYSCALL_ARG2(regs);
-        word_t tracee_message_addr = SYSCALL_ARG1(regs);
+        const word_t size = SYSCALL_ARG2(regs);
+        const word_t tracee_message_addr = SYSCALL_ARG1(regs);
 
         char *original_message = malloc(size); 
         smock_memcpy_from(pid, original_message, tracee_message_addr, size);
+        printf("original message of size %lld from %d: %s", size, pid, original_message);
+
         sniffed_message msg = {original_message, size};
         hmput(sniffed_messages, pid, msg);
 
-        printf("tracer: Got printf with size %lld: %s\n", size, original_message);
-        
         smock_memcpy_to(pid, tracee_message_addr, spoofed_message, sizeof(spoofed_message));
         SYSCALL_ARG2(regs) = (word_t)sizeof(spoofed_message);
         ptrace(PTRACE_SETREGS, pid, NULL, &regs);
@@ -45,21 +46,21 @@ void example_handle_write_entry(pid_t pid, int syscall)
 
 void example_handle_write_exit(pid_t pid, int syscall)
 {
+    (void) syscall;
     regs_t regs;
     ptrace(PTRACE_GETREGS, pid, NULL, &regs);
     if (1 == SYSCALL_ARG0(regs))
     {
         word_t tracee_message_addr = SYSCALL_ARG1(regs);
-        sniffed_message msg = hmgetp(sniffed_messages, pid)->value;
+        sniffed_message msg = hmgetp_null(sniffed_messages, pid)->value;
 
         smock_memcpy_to(pid, tracee_message_addr, msg.message, msg.length);
         SYSCALL_RET(regs) = msg.length;
         ptrace(PTRACE_SETREGS, pid, NULL, &regs);
 
         free(msg.message);
-        hmdel(sniffed_messages, pid);
+        (void)hmdel(sniffed_messages, pid);
     }
-    smock_dump_syscall(pid, false);
 }
 
 
@@ -82,3 +83,4 @@ int main(int argc, char const **argv)
 
     return smock_run(ctx);
 }
+

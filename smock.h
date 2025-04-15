@@ -2,6 +2,7 @@
 #define SMOCK_H
 
 #include <unistd.h>
+#include <stdbool.h>
 
 #include "arch/arch.h"
 #define SYSCALL_NR(regs) SMOCK_ARCH_SYSCALL_NR(regs)
@@ -25,6 +26,7 @@ struct smock_context;
 
 struct smock_context* smock_child_process(char const *executable, char *const *args);
 int smock_set_syscall_handler(struct smock_context *ctx, int syscall_nr, smock_syscall_hook hook);
+int smock_set_syscall_handler_by_name(struct smock_context *ctx, char const *name, smock_syscall_hook hook);
 word_t smock_memcpy_to(pid_t pid, word_t tracee_dst_addr, const void *src, size_t nbytes);
 void* smock_memcpy_from(pid_t pid, void *dst, word_t tracee_src_addr, size_t nbytes);
 void smock_dump_syscall(pid_t process, bool is_entry);
@@ -595,4 +597,16 @@ int smock_set_syscall_handler(struct smock_context *ctx, int syscall_nr, smock_s
     return 0;
 }
 
+int smock_set_syscall_handler_by_name(struct smock_context *ctx, char const *name, smock_syscall_hook hook)
+{
+    for (size_t i = 0; i < SYSCALL_NR_MAX; ++i)
+    {
+        if (strcmp(syscall_table[i].name, name) == 0)
+        {
+            return smock_set_syscall_handler(ctx, i, hook);
+        }
+    }
+
+    return -2;
+}
 #endif  // SMOCK_IMPLEMENTATION
